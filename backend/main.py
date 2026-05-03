@@ -124,15 +124,19 @@ def _should_aggregate(dirpath: str) -> tuple[bool, int]:
                     hit_ceiling = True
                     break
 
-        if n_files < 10:
-            return False, 0  # too sparse to judge
+        if n_files < 10 and not hit_ceiling:
+            return False, 0  # genuinely sparse, don't aggregate
 
-        avg = total_size / n_files
+        avg = total_size / n_files if n_files else 0
+        n_dirs = n_sampled - n_files
 
-        # Ceiling hit → dir definitely has many entries; only avg matters
-        # Full read → need actual count to meet threshold
-        dense = (hit_ceiling and avg < DENSITY_AVG_MAX) or \
-                (not hit_ceiling and n_files >= DENSITY_COUNT and avg < DENSITY_AVG_MAX)
+        # Condition 1: hit ceiling + small average → dense small-file dir (node_modules, __pycache__)
+        # Condition 2: hit ceiling + mostly subdirs → fan-out structure (Immich thumbs, git objects)
+        # Condition 3: full read + enough files + small average → moderate-density dir
+        fanout = hit_ceiling and n_dirs > n_files
+        dense  = (hit_ceiling and avg < DENSITY_AVG_MAX) or \
+                 fanout or \
+                 (not hit_ceiling and n_files >= DENSITY_COUNT and avg < DENSITY_AVG_MAX)
 
         if dense:
             try:
