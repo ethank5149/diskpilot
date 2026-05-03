@@ -554,4 +554,4 @@ async def dups_results(limit: int = 200):
 @app.get("/api/mounts")
 async def get_mounts(): return [{"path": m, "exists": os.path.isdir(m)} for m in MOUNTS]
 
-app.mount("/", StaticFiles(directory="/app/static", html=True), name="static")
+app.mount("/", StaticFiles(directory="static", html=True), name="static")

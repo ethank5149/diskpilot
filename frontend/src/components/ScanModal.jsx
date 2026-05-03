@@ -17,8 +17,8 @@ export default function ScanModal({ onClose }) {
         }
       } catch (_) {}
     }, 400)
-    pollRef[1](poll)
-    return () => clearInterval(poll)
+    pollRef.current = poll
+    return () => clearInterval(pollRef.current)
   }, [onClose])
 
   const abortScan = async () => {
