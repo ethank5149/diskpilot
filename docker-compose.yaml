@@ -1,0 +1,24 @@
+services:
+  diskpilot:
+    build: .
+    image: diskpilot:latest
+    container_name: diskpilot
+    environment:
+      - MOUNTS=/mnt/user,/mnt/cache,/mnt/disks,/mnt/dockercache
+      - DB_PATH=/data/diskpilot.db
+      - TRASH_DIR=/data/trash
+    volumes:
+      - /mnt/user:/mnt/user:rw
+      - /mnt/cache:/mnt/cache:rw
+      - /mnt/disks:/mnt/disks:rw
+      - /mnt/dockercache:/mnt/dockercache:rw
+      - /mnt/user/appdata/skynet/skynet-monitor/config/diskpilot:/data
+    ports:
+      - 8810:8080
+    networks:
+      - sky_net
+    restart: unless-stopped
+
+networks:
+  sky_net:
+    external: true
