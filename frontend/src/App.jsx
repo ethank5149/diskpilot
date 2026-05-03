@@ -7,6 +7,7 @@ import FileList from './components/FileList.jsx'
 import SkippedLog from './components/SkippedLog.jsx'
 import DupePanel from './components/DupePanel.jsx'
 import TrashPanel from './components/TrashPanel.jsx'
+import ScanModal from './components/ScanModal.jsx'
 
 const VIEWS = ['treemap', 'sunburst', 'list']
 const PANELS = ['skipped', 'dupes', 'trash']
@@ -14,6 +15,7 @@ const PANELS = ['skipped', 'dupes', 'trash']
 export default function App() {
   // ── scan state ──────────────────────────────────────────
   const [scan, setScan] = useState({ status: 'idle' })
+  const [scanModalOpen, setScanModalOpen] = useState(false)
   const pollRef = useRef(null)
 
   // ── tree / nav state ────────────────────────────────────
@@ -30,24 +32,31 @@ export default function App() {
   const [trashCount, setTrashCount] = useState(0)
   const [dupeState, setDupeState] = useState({ status: 'idle' })
 
-  // ── poll scan status ────────────────────────────────────
-  useEffect(() => {
-    pollRef.current = setInterval(async () => {
-      try {
-        const s = await api.scanStatus()
-        setScan(s)
-        if (s.status === 'complete' && !treeData) {
-          loadTree('__root__', [{ name: 'root', path: '__root__' }])
-        }
-      } catch (_) { }
-    }, 800)
-    return () => clearInterval(pollRef.current)
-  }, [treeData])
+   // ── poll scan status ────────────────────────────────────
+   useEffect(() => {
+     pollRef.current = setInterval(async () => {
+       try {
+         const s = await api.scanStatus()
+         setScan(s)
+         if (s.status === 'complete' || s.status === 'aborted') {
+           setScanModalOpen(false)
+         }
+       } catch (_) { }
+     }, 800)
+     return () => clearInterval(pollRef.current)
+   }, [])
 
   // ── initial mounts check ─────────────────────────────────
   useEffect(() => {
     api.scanStatus().then(setScan).catch(() => { })
   }, [])
+
+  // ── load tree when scan completes ─────────────────────────
+  useEffect(() => {
+    if (scan.status === 'complete' && !treeData) {
+      loadTree('__root__', [{ name: 'root', path: '__root__' }])
+    }
+  }, [scan.status, treeData, loadTree])
 
   const loadTree = useCallback(async (path, newCrumbs) => {
     setLoading(true)
@@ -74,15 +83,9 @@ export default function App() {
   const startScan = async () => {
     setTreeData(null)
     setCrumbs([{ name: 'root', path: '__root__' }])
+    setScanModalOpen(true)
     await api.scanStart()
     setScan({ status: 'scanning' })
-  }
-
-  const abortScan = async () => {
-    try {
-      await api.scanAbort()
-      setScan(s => ({ ...s, status: 'aborting' }))
-    } catch (_) { }
   }
 
   const currentPath = crumbs[crumbs.length - 1]?.path ?? '__root__'
@@ -103,52 +106,22 @@ export default function App() {
     }
   }, [scan.status])
 
-  // ── status bar text ────────────────────────────────────
-  const statusText = () => {
-    if (scan.status === 'scanning') {
-      const agg = scan.aggregated > 0 ? ` · ${scan.aggregated} aggregated` : ''
-      return `Scanning: ${scan.current?.split('/').slice(-2).join('/') ?? '...'} — ${scan.files?.toLocaleString()} files, ${fmtBytes(scan.bytes)}${agg}`
-    }
-    if (scan.status === 'aborting') return 'Aborting scan…'
-    if (scan.status === 'aborted') return 'Scan aborted.'
-    if (scan.status === 'complete') {
-      const agg = scan.aggregated > 0 ? ` · ${scan.aggregated} aggregated` : ''
-      return `Scanning: ${scan.current?.split('/').slice(-2).join('/') ?? '...'} — ${scan.dirs?.toLocaleString()} dirs, ${scan.files?.toLocaleString()} files, ${fmtBytes(scan.bytes)}${agg}`
-    }
-    return 'Click Scan to analyse your storage'
-  }
-
-  const isScanning = scan.status === 'scanning' || scan.status === 'aborting'
-
   return (
     <div className="app">
       {/* ── Header ── */}
       <header className="header">
         <div className="header-logo">🖥 Disk<span>Pilot</span></div>
-        <div className={`header-status ${isScanning ? 'scanning' : ''}`}>
-          {isScanning && <span className="spinner" style={{ marginRight: 8 }} />}
-          {statusText()}
+        <div className="header-status">
+          {scanModalOpen ? 'Scanning in progress…' : 'Click Scan to analyse your storage'}
         </div>
-        {isScanning ? (
-          <button
-            className="btn-danger"
-            onClick={abortScan}
-            disabled={scan.status === 'aborting'}
-          >
-            {scan.status === 'aborting' ? 'Aborting…' : '⏹ Abort'}
-          </button>
-        ) : (
-          <button className="btn-primary" onClick={startScan}>
-            Scan
-          </button>
-        )}
+        <button
+          className="btn-primary"
+          onClick={startScan}
+          disabled={scanModalOpen}
+        >
+          Scan
+        </button>
       </header>
-
-      {isScanning && (
-        <div className="progress-bar">
-          <div className="progress-fill indeterminate" />
-        </div>
-      )}
 
       <div className="app-body">
         {/* ── Sidebar ── */}
@@ -225,20 +198,11 @@ export default function App() {
 
           {/* main content */}
           <div className="content">
-            {!treeData && scan.status !== 'scanning' && (
+            {!treeData && (
               <div className="empty">
                 <div className="empty-icon">🖥</div>
                 <div className="empty-title">No data yet</div>
                 <div className="empty-sub">Click <strong>Scan</strong> to index your storage</div>
-              </div>
-            )}
-            {!treeData && scan.status === 'scanning' && (
-              <div className="empty">
-                <div className="spinner" style={{ width: 32, height: 32, borderWidth: 3 }} />
-                <div className="empty-title">Scanning…</div>
-                <div className="empty-sub mono" style={{ fontSize: 11 }}>
-                   {scan.dirs?.toLocaleString()} dirs · {scan.files?.toLocaleString()} files · {fmtBytes(scan.bytes)}
-                </div>
               </div>
             )}
             {treeData && view === 'treemap' && (
@@ -267,6 +231,11 @@ export default function App() {
           )}
         </div>
       </div>
+
+      {/* Scan Modal */}
+      {scanModalOpen && (
+        <ScanModal onClose={() => setScanModalOpen(false)} />
+      )}
     </div>
   )
 }

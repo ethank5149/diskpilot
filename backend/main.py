@@ -115,6 +115,10 @@ def _scan_single_mount(mount: str, q: queue.Queue):
         """Returns (total_recursive_size, total_recursive_count)"""
         if _scan["abort"]: return 0, 0
         
+        # NEW: Hyper-verbose real-time UI path reporting
+        with _lock:
+            _scan["current"] = path
+
         dir_size = 0
         dir_cnt = 0
         
@@ -163,13 +167,12 @@ def _scan_single_mount(mount: str, q: queue.Queue):
         q.put(("node", (path, os.path.basename(path) or path, parent, dir_size, 1, dir_cnt, mtime, depth)))
         local_stats["dirs"] += 1
         
-        # Flush UI updates periodically
-        if local_stats["dirs"] % 50 == 0:
+        # Flush UI numbers updates much more frequently
+        if local_stats["dirs"] >= 10:
             with _lock:
                 _scan["dirs"] += local_stats["dirs"]
                 _scan["files"] += local_stats["files"]
                 _scan["aggregated"] += local_stats["agg"]
-                _scan["current"] = path
             local_stats["dirs"] = local_stats["files"] = local_stats["agg"] = 0
             
         return dir_size, dir_cnt
