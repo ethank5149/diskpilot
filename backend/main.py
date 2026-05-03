@@ -1,6 +1,6 @@
 """DiskPilot v2 - Storage Analysis & Cleanup Tool"""
 from __future__ import annotations
-import hashlib, logging, os, shutil, sqlite3, threading, time
+import hashlib, logging, os, shutil, sqlite3, subprocess, threading, time
 from pathlib import Path
 from typing import Optional
 
@@ -136,7 +136,14 @@ def _should_aggregate(dirpath: str) -> tuple[bool, int]:
 
         if dense:
             try:
-                estimated = shutil.disk_usage(dirpath).used
+                result = subprocess.run(
+                    ["du", "-sb", dirpath],
+                    capture_output=True, text=True, timeout=30
+                )
+                if result.returncode == 0:
+                    estimated = int(result.stdout.split()[0])
+                else:
+                    estimated = total_size
             except Exception:
                 estimated = total_size
             return True, estimated

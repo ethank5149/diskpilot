@@ -12,7 +12,7 @@ services:
       - /mnt/cache:/mnt/cache:rw
       - /mnt/disks:/mnt/disks:rw
       - /mnt/dockercache:/mnt/dockercache:rw
-      - /mnt/user/appdata/skynet/skynet-monitor/config/diskpilot:/data
+      - /mnt/user/scripts/diskpilot/config:/data
     ports:
       - 8810:8080
     networks:

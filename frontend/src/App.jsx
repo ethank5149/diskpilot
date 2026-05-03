@@ -78,6 +78,13 @@ export default function App() {
     setScan({ status: 'scanning' })
   }
 
+  const abortScan = async () => {
+    try {
+      await api.scanAbort()
+      setScan(s => ({ ...s, status: 'aborting' }))
+    } catch (_) {}
+  }
+
   const currentPath = crumbs[crumbs.length - 1]?.path ?? '__root__'
 
   // ── refresh badge counts when panel opens ──────────────
@@ -99,33 +106,45 @@ export default function App() {
   // ── status bar text ────────────────────────────────────
   const statusText = () => {
     if (scan.status === 'scanning') {
-      return `Scanning: ${scan.current?.split('/').slice(-2).join('/') ?? '...'} — ${scan.files?.toLocaleString()} files, ${fmtBytes(scan.bytes)}`
+      const agg = scan.aggregated > 0 ? ` · ${scan.aggregated} aggregated` : ''
+      return `Scanning: ${scan.current?.split('/').slice(-2).join('/') ?? '...'} — ${scan.files?.toLocaleString()} files, ${fmtBytes(scan.bytes)}${agg}`
     }
+    if (scan.status === 'aborting') return 'Aborting scan…'
+    if (scan.status === 'aborted')  return 'Scan aborted.'
     if (scan.status === 'complete') {
-      return `Indexed ${scan.files?.toLocaleString()} files · ${scan.dirs?.toLocaleString()} dirs · ${fmtBytes(scan.bytes)} · ${scan.elapsed}s`
+      const agg = scan.aggregated > 0 ? ` · ${scan.aggregated} aggregated` : ''
+      return `Indexed ${scan.files?.toLocaleString()} files · ${scan.dirs?.toLocaleString()} dirs · ${fmtBytes(scan.bytes)}${agg} · ${scan.elapsed}s`
     }
     return 'Click Scan to analyse your storage'
   }
+
+  const isScanning = scan.status === 'scanning' || scan.status === 'aborting'
 
   return (
     <div className="app">
       {/* ── Header ── */}
       <header className="header">
         <div className="header-logo">🖥 Disk<span>Pilot</span></div>
-        <div className={`header-status ${scan.status === 'scanning' ? 'scanning' : ''}`}>
-          {scan.status === 'scanning' && <span className="spinner" style={{ marginRight: 8 }} />}
+        <div className={`header-status ${isScanning ? 'scanning' : ''}`}>
+          {isScanning && <span className="spinner" style={{ marginRight: 8 }} />}
           {statusText()}
         </div>
-        <button
-          className="btn-primary"
-          onClick={startScan}
-          disabled={scan.status === 'scanning'}
-        >
-          {scan.status === 'scanning' ? 'Scanning…' : 'Scan'}
-        </button>
+        {isScanning ? (
+          <button
+            className="btn-danger"
+            onClick={abortScan}
+            disabled={scan.status === 'aborting'}
+          >
+            {scan.status === 'aborting' ? 'Aborting…' : '⏹ Abort'}
+          </button>
+        ) : (
+          <button className="btn-primary" onClick={startScan}>
+            Scan
+          </button>
+        )}
       </header>
 
-      {scan.status === 'scanning' && (
+      {isScanning && (
         <div className="progress-bar">
           <div className="progress-fill indeterminate" />
         </div>
