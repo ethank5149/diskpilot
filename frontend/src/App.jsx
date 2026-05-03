@@ -1,34 +1,34 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { api } from './api.js'
 import { fmtBytes } from './utils.js'
-import TreeMap   from './components/TreeMap.jsx'
-import Sunburst  from './components/Sunburst.jsx'
-import FileList  from './components/FileList.jsx'
+import TreeMap from './components/TreeMap.jsx'
+import Sunburst from './components/Sunburst.jsx'
+import FileList from './components/FileList.jsx'
 import SkippedLog from './components/SkippedLog.jsx'
-import DupePanel  from './components/DupePanel.jsx'
+import DupePanel from './components/DupePanel.jsx'
 import TrashPanel from './components/TrashPanel.jsx'
 
-const VIEWS  = ['treemap', 'sunburst', 'list']
+const VIEWS = ['treemap', 'sunburst', 'list']
 const PANELS = ['skipped', 'dupes', 'trash']
 
 export default function App() {
   // ── scan state ──────────────────────────────────────────
-  const [scan, setScan]       = useState({ status: 'idle' })
-  const pollRef               = useRef(null)
+  const [scan, setScan] = useState({ status: 'idle' })
+  const pollRef = useRef(null)
 
   // ── tree / nav state ────────────────────────────────────
-  const [treeData, setTreeData]   = useState(null)
-  const [crumbs, setCrumbs]       = useState([{ name: 'root', path: '__root__' }])
-  const [loading, setLoading]     = useState(false)
+  const [treeData, setTreeData] = useState(null)
+  const [crumbs, setCrumbs] = useState([{ name: 'root', path: '__root__' }])
+  const [loading, setLoading] = useState(false)
 
   // ── view / panel state ──────────────────────────────────
-  const [view, setView]       = useState('treemap')
-  const [panel, setPanel]     = useState(null)
+  const [view, setView] = useState('treemap')
+  const [panel, setPanel] = useState(null)
 
   // ── counts for badges ───────────────────────────────────
-  const [skipCount, setSkipCount]   = useState(0)
+  const [skipCount, setSkipCount] = useState(0)
   const [trashCount, setTrashCount] = useState(0)
-  const [dupeState, setDupeState]   = useState({ status: 'idle' })
+  const [dupeState, setDupeState] = useState({ status: 'idle' })
 
   // ── poll scan status ────────────────────────────────────
   useEffect(() => {
@@ -39,14 +39,14 @@ export default function App() {
         if (s.status === 'complete' && !treeData) {
           loadTree('__root__', [{ name: 'root', path: '__root__' }])
         }
-      } catch (_) {}
+      } catch (_) { }
     }, 800)
     return () => clearInterval(pollRef.current)
   }, [treeData])
 
   // ── initial mounts check ─────────────────────────────────
   useEffect(() => {
-    api.scanStatus().then(setScan).catch(() => {})
+    api.scanStatus().then(setScan).catch(() => { })
   }, [])
 
   const loadTree = useCallback(async (path, newCrumbs) => {
@@ -82,7 +82,7 @@ export default function App() {
     try {
       await api.scanAbort()
       setScan(s => ({ ...s, status: 'aborting' }))
-    } catch (_) {}
+    } catch (_) { }
   }
 
   const currentPath = crumbs[crumbs.length - 1]?.path ?? '__root__'
@@ -90,16 +90,16 @@ export default function App() {
   // ── refresh badge counts when panel opens ──────────────
   useEffect(() => {
     if (panel === 'skipped') {
-      api.skipped().then(r => setSkipCount(r.length)).catch(() => {})
+      api.skipped().then(r => setSkipCount(r.length)).catch(() => { })
     }
     if (panel === 'trash') {
-      api.trashList().then(r => setTrashCount(r.length)).catch(() => {})
+      api.trashList().then(r => setTrashCount(r.length)).catch(() => { })
     }
   }, [panel])
 
   useEffect(() => {
     if (scan.status === 'complete') {
-      api.skipped().then(r => setSkipCount(r.length)).catch(() => {})
+      api.skipped().then(r => setSkipCount(r.length)).catch(() => { })
     }
   }, [scan.status])
 
@@ -110,10 +110,10 @@ export default function App() {
       return `Scanning: ${scan.current?.split('/').slice(-2).join('/') ?? '...'} — ${scan.files?.toLocaleString()} files, ${fmtBytes(scan.bytes)}${agg}`
     }
     if (scan.status === 'aborting') return 'Aborting scan…'
-    if (scan.status === 'aborted')  return 'Scan aborted.'
+    if (scan.status === 'aborted') return 'Scan aborted.'
     if (scan.status === 'complete') {
       const agg = scan.aggregated > 0 ? ` · ${scan.aggregated} aggregated` : ''
-      return `Indexed ${scan.files?.toLocaleString()} files · ${scan.dirs?.toLocaleString()} dirs · ${fmtBytes(scan.bytes)}${agg} · ${scan.elapsed}s`
+      return `Scanning: ${scan.current?.split('/').slice(-2).join('/') ?? '...'} — ${scan.dirs?.toLocaleString()} dirs, ${scan.files?.toLocaleString()} files, ${fmtBytes(scan.bytes)}${agg}`
     }
     return 'Click Scan to analyse your storage'
   }
@@ -237,7 +237,7 @@ export default function App() {
                 <div className="spinner" style={{ width: 32, height: 32, borderWidth: 3 }} />
                 <div className="empty-title">Scanning…</div>
                 <div className="empty-sub mono" style={{ fontSize: 11 }}>
-                  {scan.files?.toLocaleString()} files · {fmtBytes(scan.bytes)}
+                   {scan.dirs?.toLocaleString()} dirs · {scan.files?.toLocaleString()} files · {fmtBytes(scan.bytes)}
                 </div>
               </div>
             )}
@@ -261,8 +261,8 @@ export default function App() {
           {panel && (
             <div className="panel">
               {panel === 'skipped' && <SkippedLog onClose={() => setPanel(null)} />}
-              {panel === 'dupes'   && <DupePanel  onClose={() => setPanel(null)} dupeState={dupeState} setDupeState={setDupeState} />}
-              {panel === 'trash'   && <TrashPanel onClose={() => setPanel(null)} onRefresh={() => {}} setTrashCount={setTrashCount} />}
+              {panel === 'dupes' && <DupePanel onClose={() => setPanel(null)} dupeState={dupeState} setDupeState={setDupeState} />}
+              {panel === 'trash' && <TrashPanel onClose={() => setPanel(null)} onRefresh={() => { }} setTrashCount={setTrashCount} />}
             </div>
           )}
         </div>
