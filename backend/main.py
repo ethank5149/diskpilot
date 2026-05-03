@@ -20,13 +20,11 @@ MOUNTS    = [m.strip() for m in os.environ.get(
 DB_PATH   = os.environ.get("DB_PATH",   "/data/diskpilot.db")
 TRASH_DIR = os.environ.get("TRASH_DIR", "/data/trash")
 
-# ── Adaptive density aggregation ──────────────────────────────────────────────
-# Dirs that exceed both thresholds are recorded as single opaque nodes via
-# shutil.disk_usage() instead of being walked file-by-file.
-# Tune via env vars without rebuilding.
-DENSITY_PROBE   = int(os.environ.get("DENSITY_PROBE",   "200"))   # scandir entries to sample
-DENSITY_COUNT   = int(os.environ.get("DENSITY_COUNT",   "400"))   # min files to trigger
-DENSITY_AVG_MAX = int(os.environ.get("DENSITY_AVG_MAX", "65536")) # max avg file size (64 KiB)
+# ── Cleanup-focused indexing ──────────────────────────────────────────────────
+# We index ALL directories (cheap via `du`) but only files >= MIN_FILE_SIZE.
+# Smaller files don't matter for cleanup decisions and add millions of useless
+# rows. Set MIN_FILE_SIZE=0 to index everything.
+MIN_FILE_SIZE = int(os.environ.get("MIN_FILE_SIZE", str(1 * 1024 * 1024)))  # 1 MiB
 
 # ── Path safety ───────────────────────────────────────────────────────────────
 def _is_safe_path(p: str) -> bool:
@@ -94,69 +92,17 @@ async def _db_init():
 async def startup():
     await _db_init()
 
-# ── Density probe ────────────────────────────────────────────────────────────
-def _should_aggregate(dirpath: str) -> tuple[bool, int]:
-    """
-    Sample up to DENSITY_PROBE entries via a single scandir call.
-    Returns (should_aggregate, estimated_total_size).
-    Cost: one getattr per sampled entry — negligible.
+# ── Scanner — `du` for dirs, `find` for big files ────────────────────────────
+#
+# Why this is fast: `du -b` does one optimized C-level walk of the filesystem
+# and returns every directory with its already-rolled-up size. `find -size +N`
+# does the same but emits only files large enough to matter for cleanup. We
+# parse both as streams and stop instantly on abort.
+#
+# We never enumerate small files, so `__pycache__`, `node_modules`, Immich
+# thumbs, .git/objects etc. all contribute correctly to their parent dir size
+# (du sees them) but never get individual rows in the index.
 
-    Triggers when:
-      - We sampled DENSITY_PROBE entries AND avg file size < DENSITY_AVG_MAX
-        (hitting the ceiling proves the dir is large; average proves files are small), OR
-      - We read the whole dir, found >= DENSITY_COUNT files, and avg < DENSITY_AVG_MAX
-    """
-    try:
-        n_files    = 0
-        total_size = 0
-        n_sampled  = 0
-        hit_ceiling = False
-        with os.scandir(dirpath) as it:
-            for entry in it:
-                try:
-                    if entry.is_file(follow_symlinks=False):
-                        total_size += entry.stat(follow_symlinks=False).st_size
-                        n_files    += 1
-                    n_sampled += 1
-                except OSError:
-                    pass
-                if n_sampled >= DENSITY_PROBE:
-                    hit_ceiling = True
-                    break
-
-        if n_files < 10 and not hit_ceiling:
-            return False, 0  # genuinely sparse, don't aggregate
-
-        avg = total_size / n_files if n_files else 0
-        n_dirs = n_sampled - n_files
-
-        # Condition 1: hit ceiling + small average → dense small-file dir (node_modules, __pycache__)
-        # Condition 2: hit ceiling + mostly subdirs → fan-out structure (Immich thumbs, git objects)
-        # Condition 3: full read + enough files + small average → moderate-density dir
-        fanout = hit_ceiling and n_dirs > n_files
-        dense  = (hit_ceiling and avg < DENSITY_AVG_MAX) or \
-                 fanout or \
-                 (not hit_ceiling and n_files >= DENSITY_COUNT and avg < DENSITY_AVG_MAX)
-
-        if dense:
-            try:
-                result = subprocess.run(
-                    ["du", "-sb", dirpath],
-                    capture_output=True, text=True, timeout=30
-                )
-                if result.returncode == 0:
-                    estimated = int(result.stdout.split()[0])
-                else:
-                    estimated = total_size
-            except Exception:
-                estimated = total_size
-            return True, estimated
-
-        return False, 0
-    except (PermissionError, OSError):
-        return False, 0
-
-# ── Scanner — atomic: build to nodes_new, swap on success ─────────────────────
 def _do_scan():
     with _lock:
         _scan.update(status="scanning", dirs=0, files=0, bytes=0,
@@ -165,7 +111,6 @@ def _do_scan():
 
     con = sqlite3.connect(DB_PATH)
     c = con.cursor()
-    # Shadow tables — keep old data live until we succeed
     c.executescript("""
         DROP TABLE IF EXISTS nodes_new;
         DROP TABLE IF EXISTS skipped_new;
@@ -188,13 +133,27 @@ def _do_scan():
             skip_buf.clear()
         con.commit()
 
-    # Collected during walk phase; sizes rolled up afterwards
-    # node_meta: path -> (name, parent, is_dir, mtime, depth, aggregated)
-    node_meta:  dict[str, tuple] = {}
-    file_sizes: dict[str, int]   = {}   # path -> size  (files + aggregated dirs)
-    file_cnts:  dict[str, int]   = {}   # path -> file count (files=1, aggregated=0)
-
     aborted = False
+    procs: list[subprocess.Popen] = []
+
+    def _drain_stderr(proc):
+        """Background-drain stderr so the pipe doesn't fill and block."""
+        if not proc.stderr:
+            return
+        for line in proc.stderr:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            # find: '/path': Permission denied   |   du: cannot read directory '/path'
+            if "Permission denied" in line or "cannot read" in line:
+                # extract path between single quotes if present
+                a, b = line.find("'"), line.rfind("'")
+                if a != -1 and b > a:
+                    p = line[a + 1:b]
+                else:
+                    p = line
+                skip_buf.append((p, "Permission denied", time.time()))
+                _scan["skipped"] += 1
 
     for mount in MOUNTS:
         if _scan["abort"]:
@@ -205,112 +164,112 @@ def _do_scan():
             flush()
             continue
 
-        # topdown=True: we can prune dirnames before os.walk recurses into them
-        for dirpath, dirnames, filenames in os.walk(mount, topdown=True, followlinks=False):
+        # ── Phase 1: directories with rolled-up sizes ──────────────────────
+        # `du -b` outputs one line per directory: "<size>\t<path>"
+        # Sizes are recursive (already rolled up), no Python rollup needed.
+        _scan["current"] = f"phase 1: enumerating directories under {mount}"
+        du = subprocess.Popen(
+            ["du", "-b", mount],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, errors="replace", bufsize=1
+        )
+        procs.append(du)
+        stderr_thread = threading.Thread(target=_drain_stderr, args=(du,), daemon=True)
+        stderr_thread.start()
+
+        for line in du.stdout:
             if _scan["abort"]:
+                du.kill()
                 aborted = True
                 break
-
-            _scan["current"] = dirpath
-            depth = dirpath.count(os.sep)
-
-            # ── Subdir gate: permission-check and density-probe ──────────────
-            to_remove = []
-            for d in list(dirnames):
-                full = os.path.join(dirpath, d)
-
-                if not os.access(full, os.R_OK | os.X_OK):
-                    skip_buf.append((full, "Permission denied", time.time()))
-                    _scan["skipped"] += 1
-                    to_remove.append(d)
-                    continue
-
-                agg, est_size = _should_aggregate(full)
-                if agg:
-                    try:
-                        dmtime = os.lstat(full).st_mtime
-                    except Exception:
-                        dmtime = 0
-                    parent = dirpath
-                    name   = d + " ⚡"   # ⚡ = aggregated indicator
-                    node_meta[full]  = (name, parent, True, dmtime, depth + 1, True)
-                    file_sizes[full] = est_size
-                    file_cnts[full]  = 0
-                    _scan["dirs"]       += 1
-                    _scan["bytes"]      += est_size
-                    _scan["aggregated"] += 1
-                    to_remove.append(d)
-                    log.debug("Aggregated %s (~%d bytes)", full, est_size)
-
-            for d in to_remove:
-                dirnames.remove(d)
-
-            # ── Record files in this directory ───────────────────────────────
-            for fname in filenames:
-                fpath = os.path.join(dirpath, fname)
-                try:
-                    if os.path.islink(fpath):
-                        continue
-                    st = os.lstat(fpath)
-                    node_meta[fpath]  = (fname, dirpath, False, st.st_mtime, depth + 1, False)
-                    file_sizes[fpath] = st.st_size
-                    file_cnts[fpath]  = 1
-                    _scan["files"]   += 1
-                    _scan["bytes"]   += st.st_size
-                except PermissionError:
-                    skip_buf.append((fpath, "Permission denied", time.time()))
-                    _scan["skipped"] += 1
-                except Exception as e:
-                    skip_buf.append((fpath, str(e), time.time()))
-
-            # ── Record directory itself (size computed in rollup) ────────────
+            line = line.rstrip("\n")
+            if not line:
+                continue
             try:
-                dmtime = os.lstat(dirpath).st_mtime
+                size_s, path = line.split("\t", 1)
+                size = int(size_s)
+            except (ValueError, IndexError):
+                continue
+
+            _scan["current"] = path
+            depth  = path.count(os.sep)
+            name   = os.path.basename(path) or path
+            parent = str(Path(path).parent) if path != mount else None
+            try:
+                mtime = os.lstat(path).st_mtime
             except Exception:
-                dmtime = 0
-            parent = str(Path(dirpath).parent) if dirpath != mount else None
-            name   = os.path.basename(dirpath) or dirpath
-            node_meta[dirpath] = (name, parent, True, dmtime, depth, False)
-            file_sizes[dirpath] = 0   # placeholder — filled by rollup
-            file_cnts[dirpath]  = 0
+                mtime = 0
+
+            node_buf.append((path, name, parent, size, 1, 0, mtime, depth))
             _scan["dirs"] += 1
-
-            if len(skip_buf) >= 200:
-                flush()
-
-    # ── Bottom-up rollup: propagate file sizes up the directory tree ──────────
-    # Sort by depth descending so children are always processed before parents
-    if not aborted:
-        dir_size_acc: dict[str, int] = {}
-        dir_cnt_acc:  dict[str, int] = {}
-
-        all_paths = list(node_meta.keys())
-        all_paths.sort(key=lambda p: -p.count(os.sep))  # deepest first
-
-        for path in all_paths:
-            name, parent, is_dir, mtime, depth, aggregated = node_meta[path]
-            if is_dir and not aggregated:
-                sz  = dir_size_acc.get(path, 0)
-                cnt = dir_cnt_acc.get(path, 0)
-                file_sizes[path] = sz
-                file_cnts[path]  = cnt
-            else:
-                sz  = file_sizes.get(path, 0)
-                cnt = file_cnts.get(path, 1 if not is_dir else 0)
-
-            if parent and parent in node_meta:
-                dir_size_acc[parent] = dir_size_acc.get(parent, 0) + sz
-                dir_cnt_acc[parent]  = dir_cnt_acc.get(parent, 0) + cnt
-
-        # Write all nodes to buffer
-        for path, (name, parent, is_dir, mtime, depth, _agg) in node_meta.items():
-            sz  = file_sizes.get(path, 0)
-            cnt = file_cnts.get(path, 0)
-            node_buf.append((path, name, parent, sz, 1 if is_dir else 0, cnt, mtime, depth))
+            # Mount root carries the full recursive total — add once per mount
+            if path == mount:
+                _scan["bytes"] += size
             if len(node_buf) >= 2000:
                 flush()
 
+        du.wait()
+        stderr_thread.join(timeout=1)
+        if aborted:
+            break
+
+        # ── Phase 2: files >= MIN_FILE_SIZE only ───────────────────────────
+        # `find -size +Nc` filters at kernel level. Format: "<size>\t<mtime>\t<path>"
+        _scan["current"] = f"phase 2: indexing files ≥ {MIN_FILE_SIZE} bytes under {mount}"
+        find_args = ["find", mount, "-type", "f"]
+        if MIN_FILE_SIZE > 0:
+            # find's -size -1 means "0 bytes only", -size +N means strictly greater than N
+            # We want >= MIN_FILE_SIZE, so use +(N-1)c
+            find_args += ["-size", f"+{MIN_FILE_SIZE - 1}c"]
+        find_args += ["-printf", "%s\t%T@\t%p\n"]
+
+        find = subprocess.Popen(
+            find_args,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, errors="replace", bufsize=1
+        )
+        procs.append(find)
+        find_stderr_thread = threading.Thread(target=_drain_stderr, args=(find,), daemon=True)
+        find_stderr_thread.start()
+
+        for line in find.stdout:
+            if _scan["abort"]:
+                find.kill()
+                aborted = True
+                break
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            parts = line.split("\t", 2)
+            if len(parts) != 3:
+                continue
+            try:
+                size  = int(parts[0])
+                mtime = float(parts[1])
+            except ValueError:
+                continue
+            path   = parts[2]
+            name   = os.path.basename(path)
+            parent = str(Path(path).parent)
+            depth  = path.count(os.sep)
+
+            node_buf.append((path, name, parent, size, 0, 1, mtime, depth))
+            _scan["files"] += 1
+            _scan["current"] = path
+            if len(node_buf) >= 2000:
+                flush()
+
+        find.wait()
+        find_stderr_thread.join(timeout=1)
+        if aborted:
+            break
+
     flush()
+
+    # Make sure any leftover subprocs are dead
+    for p in procs:
+        if p.poll() is None:
+            p.kill()
 
     if aborted:
         c.executescript("DROP TABLE nodes_new; DROP TABLE skipped_new;")
