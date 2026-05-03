@@ -1,13 +1,12 @@
-# filepath: backend/main.py
-"""DiskPilot v2 - Storage Analysis & Cleanup Tool (Multithreaded Edition)"""
+"""DiskPilot v2 - Storage Analysis & Cleanup Tool (Dynamic Heuristics Edition)"""
 from __future__ import annotations
-import hashlib, logging, os, shutil, sqlite3, subprocess, threading, time, queue
+import hashlib, logging, os, shutil, sqlite3, sys, threading, time, queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
 import aiosqlite
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -24,16 +23,13 @@ TRASH_DIR = os.environ.get("TRASH_DIR", "/data/trash")
 MIN_FILE_SIZE = int(os.environ.get("MIN_FILE_SIZE", str(1 * 1024 * 1024)))
 
 def _is_safe_path(p: str) -> bool:
-    try:
-        rp = os.path.realpath(p)
-    except Exception:
-        return False
+    try: rp = os.path.realpath(p)
+    except Exception: return False
     allowed = [os.path.realpath(m) for m in MOUNTS] + [os.path.realpath(TRASH_DIR)]
     return any(rp == a or rp.startswith(a.rstrip("/") + "/") for a in allowed)
 
 def _safe_or_403(p: str):
-    if not _is_safe_path(p):
-        raise HTTPException(403, f"Path outside allowed mounts: {p}")
+    if not _is_safe_path(p): raise HTTPException(403, f"Path outside allowed mounts: {p}")
 
 _lock = threading.Lock()
 _scan: dict = {"status": "idle", "current": "", "dirs": 0, "files": 0,
@@ -44,13 +40,9 @@ _dups: dict = {"status": "idle", "stage": "", "current": "", "done": 0,
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS nodes (
-    path    TEXT PRIMARY KEY,
-    name    TEXT NOT NULL,
-    parent  TEXT,
-    size    INTEGER NOT NULL DEFAULT 0,
-    is_dir  INTEGER NOT NULL DEFAULT 0,
-    cnt     INTEGER NOT NULL DEFAULT 0,
-    mtime   REAL    NOT NULL DEFAULT 0,
+    path    TEXT PRIMARY KEY, name TEXT NOT NULL, parent TEXT,
+    size    INTEGER NOT NULL DEFAULT 0, is_dir INTEGER NOT NULL DEFAULT 0,
+    cnt     INTEGER NOT NULL DEFAULT 0, mtime REAL NOT NULL DEFAULT 0,
     depth   INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_parent ON nodes(parent);
@@ -59,17 +51,11 @@ CREATE INDEX IF NOT EXISTS idx_mtime  ON nodes(mtime);
 CREATE INDEX IF NOT EXISTS idx_name   ON nodes(name);
 
 CREATE TABLE IF NOT EXISTS skipped (
-    id      INTEGER PRIMARY KEY AUTOINCREMENT,
-    path    TEXT NOT NULL,
-    reason  TEXT NOT NULL,
-    ts      REAL NOT NULL
+    id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL, reason TEXT NOT NULL, ts REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS dups (
-    hash    TEXT NOT NULL,
-    path    TEXT NOT NULL,
-    size    INTEGER NOT NULL,
-    PRIMARY KEY (hash, path)
+    hash TEXT NOT NULL, path TEXT NOT NULL, size INTEGER NOT NULL, PRIMARY KEY (hash, path)
 );
 CREATE INDEX IF NOT EXISTS idx_dup_hash ON dups(hash);
 """
@@ -82,22 +68,17 @@ async def _db_init():
         await db.commit()
 
 @app.on_event("startup")
-async def startup():
-    await _db_init()
+async def startup(): await _db_init()
 
 # ── Thread-Safe DB Writer ─────────────────────────────────────────────────────
 def _db_writer_thread(q: queue.Queue):
-    """Dedicated single thread to ingest queue data and write to SQLite"""
     con = sqlite3.connect(DB_PATH)
     c = con.cursor()
-    node_buf: list[tuple] = []
-    skip_buf: list[tuple] = []
+    node_buf, skip_buf = [], []
 
     def flush():
         if node_buf:
-            c.executemany(
-                "INSERT OR REPLACE INTO nodes_new(path,name,parent,size,is_dir,cnt,mtime,depth) "
-                "VALUES(?,?,?,?,?,?,?,?)", node_buf)
+            c.executemany("INSERT OR REPLACE INTO nodes_new(path,name,parent,size,is_dir,cnt,mtime,depth) VALUES(?,?,?,?,?,?,?,?)", node_buf)
             node_buf.clear()
         if skip_buf:
             c.executemany("INSERT INTO skipped_new(path,reason,ts) VALUES(?,?,?)", skip_buf)
@@ -106,142 +87,102 @@ def _db_writer_thread(q: queue.Queue):
 
     while True:
         item = q.get()
-        if item is None:  # Sentinel value to terminate thread
-            flush()
-            q.task_done()
-            break
-        
+        if item is None:
+            flush(); q.task_done(); break
         msg_type, payload = item
         if msg_type == "node":
             node_buf.append(payload)
-            if len(node_buf) >= 2000:
-                flush()
+            if len(node_buf) >= 2000: flush()
         elif msg_type == "skip":
             skip_buf.append(payload)
-            if len(skip_buf) >= 2000:
-                flush()
+            if len(skip_buf) >= 2000: flush()
         q.task_done()
-
     con.close()
 
-# ── Parallel Mount Scanner ────────────────────────────────────────────────────
+# ── Single-Pass Dynamic Heuristic Scanner ─────────────────────────────────────
 def _scan_single_mount(mount: str, q: queue.Queue):
-    """Scans a single mount. Run inside a ThreadPoolExecutor."""
     if _scan["abort"]: return
     if not os.path.isdir(mount):
         q.put(("skip", (mount, "Mount not found", time.time())))
         return
 
-    def _drain_stderr(proc):
-        if not proc.stderr: return
-        for line in proc.stderr:
-            line = line.rstrip("\n")
-            if not line: continue
-            if "Permission denied" in line or "cannot read" in line:
-                a, b = line.find("'"), line.rfind("'")
-                p = line[a + 1:b] if (a != -1 and b > a) else line
-                q.put(("skip", (p, "Permission denied", time.time())))
-                with _lock:
-                    _scan["skipped"] += 1
+    # Deep directory structures need slightly higher recursion limits
+    sys.setrecursionlimit(10000)
+    
+    local_stats = {"dirs": 0, "files": 0, "agg": 0, "bytes": 0}
 
-    # Phase 1: Directories (du)
-    with _lock:
-        _scan["current"] = f"enumerating {mount} directories..."
+    def walk(path: str) -> tuple[int, int]:
+        """Returns (total_recursive_size, total_recursive_count)"""
+        if _scan["abort"]: return 0, 0
         
-    du = subprocess.Popen(
-        ["du", "-b", mount],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, errors="replace", bufsize=1
-    )
-    stderr_thread = threading.Thread(target=_drain_stderr, args=(du,), daemon=True)
-    stderr_thread.start()
-
-    local_dirs = 0
-    local_bytes = 0
-    for line in du.stdout:
-        if _scan["abort"]:
-            du.kill()
-            break
+        dir_size = 0
+        dir_cnt = 0
+        
         try:
-            size_s, path = line.rstrip("\n").split("\t", 1)
-            size = int(size_s)
-        except (ValueError, IndexError):
-            continue
+            with os.scandir(path) as it: entries = list(it)
+        except OSError as e:
+            q.put(("skip", (path, "Permission denied or missing", time.time())))
+            with _lock: _scan["skipped"] += 1
+            return 0, 0
 
-        depth = path.count(os.sep)
-        name = os.path.basename(path) or path
-        parent = str(Path(path).parent) if path != mount else None
-        mtime = os.lstat(path).st_mtime if os.path.exists(path) else 0
+        # Separate files and directories
+        files = [e for e in entries if e.is_file(follow_symlinks=False)]
+        dirs = [e for e in entries if e.is_dir(follow_symlinks=False)]
 
-        q.put(("node", (path, name, parent, size, 1, 0, mtime, depth)))
-        local_dirs += 1
-        if path == mount:
-            local_bytes += size
+        # 1. Dynamically evaluate files in this directory
+        for f in files:
+            try:
+                # Use OS cache via stat() - zero syscall overhead
+                st = f.stat(follow_symlinks=False)
+                sz = st.st_size
+                dir_size += sz
+                dir_cnt += 1
+                
+                # Dynamic Aggregation Heuristic
+                if sz < MIN_FILE_SIZE:
+                    local_stats["agg"] += 1
+                else:
+                    q.put(("node", (f.path, f.name, path, sz, 0, 1, st.st_mtime, path.count(os.sep) + 1)))
+                    local_stats["files"] += 1
+            except OSError:
+                pass
 
-        # Update global state periodically to avoid lock contention
-        if local_dirs % 100 == 0:
-            with _lock:
-                _scan["dirs"] += local_dirs
-                _scan["bytes"] += local_bytes
-                _scan["current"] = path
-            local_dirs = 0
-            local_bytes = 0
+        # 2. Recurse into subdirectories (Bottom-Up resolution)
+        for d in dirs:
+            c_size, c_cnt = walk(d.path)
+            dir_size += c_size
+            dir_cnt += c_cnt
 
-    du.wait()
-    stderr_thread.join(timeout=1)
-    with _lock:
-        _scan["dirs"] += local_dirs
-        _scan["bytes"] += local_bytes
-
-    if _scan["abort"]: return
-
-    # Phase 2: Files (find)
-    with _lock:
-        _scan["current"] = f"indexing {mount} files..."
+        # 3. Emit rolled-up directory node
+        try: mtime = os.stat(path, follow_symlinks=False).st_mtime
+        except OSError: mtime = 0
         
-    find_args = ["find", mount, "-type", "f"]
-    if MIN_FILE_SIZE > 0:
-        find_args += ["-size", f"+{MIN_FILE_SIZE - 1}c"]
-    find_args += ["-printf", "%s\t%T@\t%p\n"]
-
-    find = subprocess.Popen(
-        find_args,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, errors="replace", bufsize=1
-    )
-    find_stderr_thread = threading.Thread(target=_drain_stderr, args=(find,), daemon=True)
-    find_stderr_thread.start()
-
-    local_files = 0
-    for line in find.stdout:
-        if _scan["abort"]:
-            find.kill()
-            break
-        parts = line.rstrip("\n").split("\t", 2)
-        if len(parts) != 3: continue
-        try:
-            size = int(parts[0])
-            mtime = float(parts[1])
-        except ValueError:
-            continue
-        path = parts[2]
-        name = os.path.basename(path)
-        parent = str(Path(path).parent)
         depth = path.count(os.sep)
-
-        q.put(("node", (path, name, parent, size, 0, 1, mtime, depth)))
-        local_files += 1
+        parent = os.path.dirname(path) if path != mount else None
         
-        if local_files % 100 == 0:
+        q.put(("node", (path, os.path.basename(path) or path, parent, dir_size, 1, dir_cnt, mtime, depth)))
+        local_stats["dirs"] += 1
+        
+        # Flush UI updates periodically
+        if local_stats["dirs"] % 50 == 0:
             with _lock:
-                _scan["files"] += local_files
+                _scan["dirs"] += local_stats["dirs"]
+                _scan["files"] += local_stats["files"]
+                _scan["aggregated"] += local_stats["agg"]
                 _scan["current"] = path
-            local_files = 0
+            local_stats["dirs"] = local_stats["files"] = local_stats["agg"] = 0
+            
+        return dir_size, dir_cnt
 
-    find.wait()
-    find_stderr_thread.join(timeout=1)
+    # Kick off the recursive single-pass walk
+    root_size, _ = walk(mount)
+    
+    # Final cleanup flush
     with _lock:
-        _scan["files"] += local_files
+        _scan["dirs"] += local_stats["dirs"]
+        _scan["files"] += local_stats["files"]
+        _scan["aggregated"] += local_stats["agg"]
+        _scan["bytes"] += root_size
 
 # ── Main Scan Orchestrator ────────────────────────────────────────────────────
 def _do_scan():
@@ -253,64 +194,44 @@ def _do_scan():
     con = sqlite3.connect(DB_PATH)
     c = con.cursor()
     c.executescript("""
-        DROP TABLE IF EXISTS nodes_new;
-        DROP TABLE IF EXISTS skipped_new;
-        CREATE TABLE nodes_new   AS SELECT * FROM nodes   WHERE 0;
+        DROP TABLE IF EXISTS nodes_new; DROP TABLE IF EXISTS skipped_new;
+        CREATE TABLE nodes_new AS SELECT * FROM nodes WHERE 0;
         CREATE TABLE skipped_new AS SELECT * FROM skipped WHERE 0;
     """)
-    con.commit()
-    con.close()
+    con.commit(); con.close()
 
-    # 1. Start the DB Writer Thread
     q = queue.Queue()
     writer_thread = threading.Thread(target=_db_writer_thread, args=(q,))
     writer_thread.start()
 
-    # 2. Launch concurrent mount scanners
     with ThreadPoolExecutor(max_workers=len(MOUNTS)) as executor:
         futures = [executor.submit(_scan_single_mount, mount, q) for mount in MOUNTS]
-        for future in as_completed(futures):
-            future.result()  # Re-raise any exceptions that occurred in the thread
+        for future in as_completed(futures): future.result()
 
-    # 3. Shutdown DB writer
-    q.put(None)
-    writer_thread.join()
+    q.put(None); writer_thread.join()
 
-    # 4. Handle Abort vs Success
     con = sqlite3.connect(DB_PATH)
     c = con.cursor()
     if _scan["abort"]:
         c.executescript("DROP TABLE nodes_new; DROP TABLE skipped_new;")
-        con.commit()
-        con.close()
-        with _lock:
-            _scan.update(status="aborted", elapsed=round(time.time() - _scan["started"], 1))
-        log.info("Scan aborted by user")
+        con.commit(); con.close()
+        with _lock: _scan.update(status="aborted", elapsed=round(time.time() - _scan["started"], 1))
         return
 
-    # Atomic swap
     c.executescript("""
-        DROP TABLE IF EXISTS nodes_old;
-        DROP TABLE IF EXISTS skipped_old;
-        ALTER TABLE nodes   RENAME TO nodes_old;
-        ALTER TABLE skipped RENAME TO skipped_old;
-        ALTER TABLE nodes_new   RENAME TO nodes;
-        ALTER TABLE skipped_new RENAME TO skipped;
-        DROP TABLE nodes_old;
-        DROP TABLE skipped_old;
-    """)
-    c.executescript("""
+        DROP TABLE IF EXISTS nodes_old; DROP TABLE IF EXISTS skipped_old;
+        ALTER TABLE nodes RENAME TO nodes_old; ALTER TABLE skipped RENAME TO skipped_old;
+        ALTER TABLE nodes_new RENAME TO nodes; ALTER TABLE skipped_new RENAME TO skipped;
+        DROP TABLE nodes_old; DROP TABLE skipped_old;
         CREATE INDEX IF NOT EXISTS idx_parent ON nodes(parent);
-        CREATE INDEX IF NOT EXISTS idx_size   ON nodes(size DESC);
-        CREATE INDEX IF NOT EXISTS idx_mtime  ON nodes(mtime);
-        CREATE INDEX IF NOT EXISTS idx_name   ON nodes(name);
+        CREATE INDEX IF NOT EXISTS idx_size ON nodes(size DESC);
+        CREATE INDEX IF NOT EXISTS idx_mtime ON nodes(mtime);
+        CREATE INDEX IF NOT EXISTS idx_name ON nodes(name);
     """)
-    con.commit()
-    con.close()
+    con.commit(); con.close()
 
-    with _lock:
-        _scan.update(status="complete", elapsed=round(time.time() - _scan["started"], 1))
-    log.info(f"Scan complete: {_scan['files']} files, {_scan['dirs']} dirs, {_scan['skipped']} skipped")
+    with _lock: _scan.update(status="complete", elapsed=round(time.time() - _scan["started"], 1))
+    log.info(f"Scan complete: {_scan['files']} files, {_scan['dirs']} dirs, {_scan['aggregated']} aggregated")
 
 @app.post("/api/scan/start")
 async def scan_start():
@@ -320,27 +241,22 @@ async def scan_start():
 
 @app.post("/api/scan/abort")
 async def scan_abort():
-    if _scan["status"] != "scanning": return {"status": "noop"}
     with _lock: _scan["abort"] = True
     return {"status": "aborting"}
 
 @app.get("/api/scan/status")
 async def scan_status():
-    with _lock:
-        s = dict(_scan)
-    if s["status"] == "scanning" and s["started"]:
-        s["elapsed"] = round(time.time() - s["started"], 1)
+    with _lock: s = dict(_scan)
+    if s["status"] == "scanning" and s["started"]: s["elapsed"] = round(time.time() - s["started"], 1)
     return s
 
-# ── Tree & Summary Endpoints (Unchanged logic, compacted for brevity) ─────────
+# ── Tree & Summary Endpoints ──────────────────────────────────────────────────
 TREE_SQL = """
 WITH RECURSIVE tree(path,name,parent,size,is_dir,cnt,mtime,depth,lvl) AS (
-    SELECT path,name,parent,size,is_dir,cnt,mtime,depth, 0
-    FROM nodes WHERE path = ?
+    SELECT path,name,parent,size,is_dir,cnt,mtime,depth, 0 FROM nodes WHERE path = ?
   UNION ALL
     SELECT n.path,n.name,n.parent,n.size,n.is_dir,n.cnt,n.mtime,n.depth, t.lvl + 1
-    FROM nodes n JOIN tree t ON n.parent = t.path
-    WHERE t.lvl < ? AND n.is_dir = 1
+    FROM nodes n JOIN tree t ON n.parent = t.path WHERE t.lvl < ? AND n.is_dir = 1
 )
 SELECT * FROM tree
 """
@@ -365,8 +281,7 @@ def _build_subtree(rows, root_path, max_per_level):
         if rest:
             node["children"].append({
                 "name": f"[+{len(rest)} more]", "path": node["path"] + "/__more__",
-                "size": sum(k["size"] for k in rest), "is_dir": False, "cnt": sum(k["cnt"] for k in rest),
-                "mtime": 0, "_more": True
+                "size": sum(k["size"] for k in rest), "is_dir": False, "cnt": sum(k["cnt"] for k in rest), "mtime": 0, "_more": True
             })
     attach(root)
     return root
@@ -382,11 +297,9 @@ async def get_tree(path: str = "__root__", depth: int = 3, max_per_level: int = 
                     node = _build_subtree(await cur.fetchall(), m, max_per_level)
                 if node:
                     children.append(node)
-                    total += node["size"]
-                    cnt += node["cnt"]
+                    total += node["size"]; cnt += node["cnt"]
             return {"name": "root", "path": "__root__", "size": total, "is_dir": True, "cnt": cnt, "mtime": 0, "children": children}
-        async with db.execute(TREE_SQL, (path, depth)) as cur:
-            node = _build_subtree(await cur.fetchall(), path, max_per_level)
+        async with db.execute(TREE_SQL, (path, depth)) as cur: node = _build_subtree(await cur.fetchall(), path, max_per_level)
         if not node: raise HTTPException(404)
         return node
 
@@ -404,15 +317,12 @@ async def ls(path: str, sort: str = "size", offset: int = 0, limit: int = 200):
 @app.get("/api/search")
 async def search(q: str, limit: int = 200, only: str = "all"):
     if not q or len(q) < 2: return {"items": [], "total": 0}
-    where = "WHERE name LIKE ? COLLATE NOCASE" + (
-        " AND is_dir = 0" if only == "files" else " AND is_dir = 1" if only == "dirs" else ""
-    )
+    where = "WHERE name LIKE ? COLLATE NOCASE" + (" AND is_dir = 0" if only == "files" else " AND is_dir = 1" if only == "dirs" else "")
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(f"SELECT * FROM nodes {where} ORDER BY size DESC LIMIT ?", (f"%{q}%", limit)) as cur:
             rows = await cur.fetchall()
-        async with db.execute(f"SELECT COUNT(*) FROM nodes {where}", (f"%{q}%",)) as cur:
-            t = await cur.fetchone()
+        async with db.execute(f"SELECT COUNT(*) FROM nodes {where}", (f"%{q}%",)) as cur: t = await cur.fetchone()
     return {"total": t[0], "items": [dict(r) for r in rows]}
 
 @app.get("/api/summary")
@@ -452,9 +362,7 @@ async def summary():
         if os.path.isdir(TRASH_DIR):
             for r, _, fs in os.walk(TRASH_DIR):
                 for f in fs:
-                    try:
-                        trash_size += os.path.getsize(os.path.join(r, f))
-                        trash_cnt += 1
+                    try: trash_size += os.path.getsize(os.path.join(r, f)); trash_cnt += 1
                     except Exception: pass
 
     return {"total_files": tot["f"], "total_bytes": tot["b"], "mounts": mount_rows, "biggest_files": biggest, "biggest_dirs": biggest_dirs, "stale_large": stale, "extensions": top_exts, "dup_stats": dup_stats, "trash": {"size": trash_size, "count": trash_cnt}}
@@ -463,8 +371,7 @@ async def summary():
 async def get_skipped(limit: int = 1000):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM skipped ORDER BY ts DESC LIMIT ?", (limit,)) as cur:
-            return [dict(r) for r in await cur.fetchall()]
+        async with db.execute("SELECT * FROM skipped ORDER BY ts DESC LIMIT ?", (limit,)) as cur: return [dict(r) for r in await cur.fetchall()]
 
 # ── Actions (Trash/Delete) ────────────────────────────────────────────────────
 class PathBody(BaseModel): path: str
@@ -478,8 +385,7 @@ async def _remove_from_index(path: str):
 
 def _move_safely(src: str, dst: str):
     os.makedirs(os.path.dirname(dst), exist_ok=True)
-    try:
-        os.rename(src, dst)
+    try: os.rename(src, dst)
     except OSError:
         if os.path.isdir(src): shutil.copytree(src, dst, symlinks=True); shutil.rmtree(src)
         else: shutil.copy2(src, dst); os.unlink(src)
@@ -506,8 +412,7 @@ async def trash_move_many(body: PathsBody):
             _move_safely(p, dst)
             await _remove_from_index(p)
             results.append({"path": p, "ok": True})
-        except Exception as e:
-            results.append({"path": p, "ok": False, "error": str(e)})
+        except Exception as e: results.append({"path": p, "ok": False, "error": str(e)})
     return {"results": results}
 
 @app.post("/api/trash/restore")
@@ -578,13 +483,11 @@ def _full_hash(path: str) -> str:
     return h.hexdigest()
 
 def _do_dups():
-    with _lock:
-        _dups.update(status="scanning", stage="size-grouping", done=0, total=0, groups=0, wasted=0, current="", abort=False)
+    with _lock: _dups.update(status="scanning", stage="size-grouping", done=0, total=0, groups=0, wasted=0, current="", abort=False)
 
     con = sqlite3.connect(DB_PATH)
     c = con.cursor()
-    c.execute("DELETE FROM dups")
-    con.commit()
+    c.execute("DELETE FROM dups"); con.commit()
 
     c.execute("SELECT path, size FROM nodes WHERE is_dir=0 AND size >= ?", (MIN_DUP_SIZE,))
     by_size = {}
@@ -602,7 +505,6 @@ def _do_dups():
         for size, paths in candidates:
             if _dups["abort"]: break
             for path in paths: futures.append(executor.submit(hash_sample_task, path, size))
-        
         for future in as_completed(futures):
             if _dups["abort"]: break
             try:
@@ -610,12 +512,9 @@ def _do_dups():
                 sample_groups.setdefault(sh, []).append((p, s))
             except Exception: pass
             with _lock:
-                _dups["done"] += 1
-                _dups["current"] = p
+                _dups["done"] += 1; _dups["current"] = p
 
-    if _dups["abort"]:
-        con.close(); _dups["status"] = "aborted"
-        return
+    if _dups["abort"]: con.close(); _dups["status"] = "aborted"; return
 
     sample_dupes = [(h, ps) for h, ps in sample_groups.items() if len(ps) > 1]
 
@@ -631,7 +530,6 @@ def _do_dups():
         for _, paths_with_size in sample_dupes:
             if _dups["abort"]: break
             for path, size in paths_with_size: futures.append(executor.submit(hash_full_task, path, size))
-                
         for future in as_completed(futures):
             if _dups["abort"]: break
             try:
@@ -639,12 +537,9 @@ def _do_dups():
                 full_groups.setdefault(fh, []).append((p, s))
             except Exception: pass
             with _lock:
-                _dups["done"] += 1
-                _dups["current"] = p
+                _dups["done"] += 1; _dups["current"] = p
 
-    if _dups["abort"]:
-        con.close(); _dups["status"] = "aborted"
-        return
+    if _dups["abort"]: con.close(); _dups["status"] = "aborted"; return
 
     final_groups = {h: ps for h, ps in full_groups.items() if len(ps) > 1}
     _dups["groups"] = len(final_groups)
@@ -680,7 +575,6 @@ async def dups_results(limit: int = 200):
     return [{"hash": r["hash"], "size": r["size"], "paths": r["paths"].split("||"), "count": r["cnt"]} for r in rows]
 
 @app.get("/api/mounts")
-async def get_mounts():
-    return [{"path": m, "exists": os.path.isdir(m)} for m in MOUNTS]
+async def get_mounts(): return [{"path": m, "exists": os.path.isdir(m)} for m in MOUNTS]
 
 app.mount("/", StaticFiles(directory="/app/static", html=True), name="static")
