@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
-import * as d3 from 'd3'
+import { select } from 'd3-selection'
+import { hierarchy, treemap } from 'd3-hierarchy'
 import { fmtBytes, mountColor } from '../utils.js'
 
 // Add synthetic "[files]" remainder leaf so directory sizes are accurate
@@ -30,16 +31,16 @@ export default function TreeMap({ data, onNavigate }) {
     const { width, height } = wrapRef.current.getBoundingClientRect()
     if (width < 10 || height < 10) return
 
-    const svg = d3.select(svgRef.current)
+    const svg = select(svgRef.current)
       .attr('width', width).attr('height', height)
     svg.selectAll('*').remove()
 
     const prepared = withRemainders(data)
-    const root = d3.hierarchy(prepared)
+    const root = hierarchy(prepared)
       .sum(d => (!d.children?.length) ? Math.max(0, d.size ?? 0) : 0)
       .sort((a, b) => b.value - a.value)
 
-    d3.treemap()
+    treemap()
       .size([width, height])
       .paddingOuter(4)
       .paddingTop(18)

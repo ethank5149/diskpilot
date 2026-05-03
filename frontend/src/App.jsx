@@ -51,13 +51,6 @@ export default function App() {
     api.scanStatus().then(setScan).catch(() => { })
   }, [])
 
-  // ── load tree when scan completes ─────────────────────────
-  useEffect(() => {
-    if (scan.status === 'complete' && !treeData) {
-      loadTree('__root__', [{ name: 'root', path: '__root__' }])
-    }
-  }, [scan.status, treeData, loadTree])
-
   const loadTree = useCallback(async (path, newCrumbs) => {
     setLoading(true)
     try {
@@ -68,6 +61,13 @@ export default function App() {
       setLoading(false)
     }
   }, [])
+
+  // ── load tree when scan completes ─────────────────────────
+  useEffect(() => {
+    if (scan.status === 'complete' && !treeData) {
+      loadTree('__root__', [{ name: 'root', path: '__root__' }])
+    }
+  }, [scan.status, treeData, loadTree])
 
   const navigateTo = useCallback((path, name) => {
     const existingIdx = crumbs.findIndex(c => c.path === path)

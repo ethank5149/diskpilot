@@ -1,5 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
-import * as d3 from 'd3'
+import { select } from 'd3-selection'
+import { hierarchy, partition } from 'd3-hierarchy'
+import { arc } from 'd3-shape'
+import { color } from 'd3-color'
 import { fmtBytes, mountColor } from '../utils.js'
 
 export default function Sunburst({ data, onNavigate }) {
@@ -13,19 +16,19 @@ export default function Sunburst({ data, onNavigate }) {
     const R = Math.min(width, height) / 2 - 10
     if (R < 50) return
 
-    const svg = d3.select(svgRef.current)
+    const svg = select(svgRef.current)
       .attr('viewBox', `${-width / 2} ${-height / 2} ${width} ${height}`)
       .attr('width', width).attr('height', height)
     svg.selectAll('*').remove()
 
-    const root = d3.hierarchy(data)
+    const root = hierarchy(data)
       .sum(d => (!d.children?.length) ? Math.max(0, d.size ?? 0) : 0)
       .sort((a, b) => b.value - a.value)
 
-    d3.partition().size([2 * Math.PI, R])(root)
+    partition().size([2 * Math.PI, R])(root)
     root.each(d => { d.current = { x0: d.x0, x1: d.x1, y0: d.y0, y1: d.y1 } })
 
-    const arc = d3.arc()
+    const arcGenerator = arc()
       .startAngle(d => d.x0).endAngle(d => d.x1)
       .innerRadius(d => d.y0).outerRadius(d => d.y1 - 2)
       .padAngle(0.005).padRadius(R / 2)
@@ -43,10 +46,10 @@ export default function Sunburst({ data, onNavigate }) {
     const path = g.selectAll('path')
       .data(root.descendants().slice(1))
       .join('path')
-      .attr('fill', d => { const c = d3.color(getColor(d)); if (c) c.opacity = 0.7 + 0.3 * (1 - d.depth / 6); return c ?? getColor(d) })
+      .attr('fill', d => { const c = color(getColor(d)); if (c) c.opacity = 0.7 + 0.3 * (1 - d.depth / 6); return c ?? getColor(d) })
       .attr('fill-opacity', d => arcVisible(d.current) ? 0.8 : 0)
       .attr('pointer-events', d => arcVisible(d.current) ? 'auto' : 'none')
-      .attr('d', d => arc(d.current))
+      .attr('d', d => arcGenerator(d.current))
       .style('cursor', d => d.data.is_dir ? 'pointer' : 'default')
 
     const label = g.selectAll('text')

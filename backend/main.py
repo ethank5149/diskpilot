@@ -9,11 +9,13 @@ import aiosqlite
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("diskpilot")
 
 app = FastAPI(title="DiskPilot")
+STATIC_DIR = Path(__file__).parent.resolve() / "static"
 
 MOUNTS    = [m.strip() for m in os.environ.get("MOUNTS", "/mnt/user,/mnt/cache,/mnt/disks,/mnt/dockercache").split(",") if m.strip()]
 DB_PATH   = os.environ.get("DB_PATH", "/data/diskpilot.db")
@@ -554,4 +556,4 @@ async def dups_results(limit: int = 200):
 @app.get("/api/mounts")
 async def get_mounts(): return [{"path": m, "exists": os.path.isdir(m)} for m in MOUNTS]
 
-app.mount("/", StaticFiles(directory="static", html=True), name="static")
+app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
